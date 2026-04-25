@@ -7,6 +7,7 @@
 #include <gdiplus.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <thread>
@@ -42,8 +43,10 @@ private:
     void CreateUiResources();
     void ApplyControlFonts();
     void LayoutControls();
-    void StartScan();
+    void StartScan(bool all_drives);
     void StopScan();
+    void RequestStop(bool exit_after_stop);
+    void CheckScanWatchdog();
     void OnScanProgress(std::unique_ptr<ScanProgress> progress);
     void OnScanDone(std::unique_ptr<ScanResult> result);
     void PopulateGroups();
@@ -63,6 +66,7 @@ private:
     HWND title_label_ = nullptr;
     HWND subtitle_label_ = nullptr;
     HWND scan_button_ = nullptr;
+    HWND scan_all_button_ = nullptr;
     HWND stop_button_ = nullptr;
     HWND auto_button_ = nullptr;
     HWND delete_button_ = nullptr;
@@ -80,7 +84,13 @@ private:
     ULONG_PTR gdiplus_token_ = 0;
     std::thread scan_thread_;
     std::atomic_bool cancel_scan_ = false;
+    std::chrono::steady_clock::time_point scan_started_at_{};
+    std::chrono::steady_clock::time_point last_progress_at_{};
+    std::chrono::steady_clock::time_point stop_requested_at_{};
+    std::chrono::steady_clock::time_point close_requested_at_{};
     bool scanning_ = false;
+    bool exit_when_scan_finishes_ = false;
+    bool stop_requested_ = false;
     int current_group_ = -1;
     std::wstring preview_path_;
     std::vector<UiGroup> groups_;

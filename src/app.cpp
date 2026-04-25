@@ -19,10 +19,12 @@ constexpr int kIdScan = 1001;
 constexpr int kIdStop = 1002;
 constexpr int kIdAuto = 1003;
 constexpr int kIdDelete = 1004;
+constexpr int kIdScanAll = 1005;
 constexpr int kIdGroups = 2001;
 constexpr int kIdFiles = 2002;
 constexpr UINT kMsgScanProgress = WM_APP + 1;
 constexpr UINT kMsgScanDone = WM_APP + 2;
+constexpr UINT_PTR kScanWatchdogTimer = 3001;
 
 const wchar_t* kMainClass = L"DuplicateImageFinder.MainWindow";
 const wchar_t* kPreviewClass = L"DuplicateImageFinder.PreviewPane";
@@ -209,7 +211,7 @@ void App::CreateUiResources() {
 void App::ApplyControlFonts() {
     const HWND controls[] = {
         title_label_, subtitle_label_, scan_button_, stop_button_, auto_button_, delete_button_,
-        status_label_, group_list_, file_list_
+        scan_all_button_, status_label_, group_list_, file_list_
     };
     for (HWND control : controls) {
         if (control) {
@@ -227,13 +229,16 @@ void App::CreateControls() {
     title_label_ = CreateWindowExW(0, WC_STATICW, L"重复图片查找器",
                                    WS_CHILD | WS_VISIBLE | SS_LEFT,
                                    0, 0, 100, 28, hwnd_, nullptr, instance_, nullptr);
-    subtitle_label_ = CreateWindowExW(0, WC_STATICW, L"扫描本地硬盘，找出内容完全相同的图片，并将勾选项放入回收站。",
+    subtitle_label_ = CreateWindowExW(0, WC_STATICW, L"默认扫描图片、桌面、下载等常用目录；需要彻底查找时可扫描全部硬盘。",
                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
                                       0, 0, 100, 20, hwnd_, nullptr, instance_, nullptr);
 
-    scan_button_ = CreateWindowExW(0, WC_BUTTONW, L"开始扫描硬盘",
+    scan_button_ = CreateWindowExW(0, WC_BUTTONW, L"扫描常用目录",
                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                   0, 0, 120, 34, hwnd_, ControlId(kIdScan), instance_, nullptr);
+    scan_all_button_ = CreateWindowExW(0, WC_BUTTONW, L"扫描全部硬盘",
+                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                       0, 0, 120, 34, hwnd_, ControlId(kIdScanAll), instance_, nullptr);
     stop_button_ = CreateWindowExW(0, WC_BUTTONW, L"停止",
                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                   0, 0, 80, 30, hwnd_, ControlId(kIdStop), instance_, nullptr);
@@ -247,7 +252,7 @@ void App::CreateControls() {
     progress_bar_ = CreateWindowExW(0, PROGRESS_CLASSW, nullptr,
                                     WS_CHILD | WS_VISIBLE | PBS_MARQUEE,
                                     0, 0, 100, 18, hwnd_, nullptr, instance_, nullptr);
-    status_label_ = CreateWindowExW(0, WC_STATICW, L"点击“开始扫描硬盘”查找重复图片。",
+    status_label_ = CreateWindowExW(0, WC_STATICW, L"点击“扫描常用目录”快速查找重复图片；全盘扫描会慢很多。",
                                     WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
                                     0, 0, 100, 22, hwnd_, nullptr, instance_, nullptr);
 
@@ -300,6 +305,8 @@ void App::LayoutControls() {
     const int toolbar_top = top + 68;
     MoveWindow(scan_button_, x, toolbar_top, 142, button_h, TRUE);
     x += 154;
+    MoveWindow(scan_all_button_, x, toolbar_top, 142, button_h, TRUE);
+    x += 154;
     MoveWindow(stop_button_, x, toolbar_top, 86, button_h, TRUE);
     x += 98;
     MoveWindow(auto_button_, x, toolbar_top, 110, button_h, TRUE);
@@ -324,7 +331,7 @@ void App::LayoutControls() {
     MoveWindow(preview_, right_x, preview_y, right_w, preview_h, TRUE);
 }
 
-void App::StartScan() {
+void App::StartScan(bool all_drives) {
     if (scanning_) {
         return;
     }
@@ -341,17 +348,23 @@ void App::StartScan() {
     InvalidateRect(preview_, nullptr, TRUE);
 
     scanning_ = true;
+    exit_when_scan_finishes_ = false;
+    stop_requested_ = false;
     cancel_scan_.store(false);
+    scan_started_at_ = std::chrono::steady_clock::now();
+    last_progress_at_ = scan_started_at_;
+    stop_requested_at_ = {};
     SendMessageW(progress_bar_, PBM_SETMARQUEE, TRUE, 30);
-    UpdateStatus(L"正在扫描本地硬盘，请稍候...");
+    UpdateStatus(all_drives ? L"正在扫描全部本地硬盘，请稍候..." : L"正在扫描常用目录，请稍候...");
     UpdateButtons();
+    SetTimer(hwnd_, kScanWatchdogTimer, 1000, nullptr);
 
-    scan_thread_ = std::thread([this]() {
+    scan_thread_ = std::thread([this, all_drives]() {
         ScanResult result;
         try {
             Scanner scanner;
             auto last_progress = std::chrono::steady_clock::now() - std::chrono::seconds(1);
-            result = scanner.ScanAllFixedDrives(cancel_scan_, [this, &last_progress](const ScanProgress& progress) {
+            auto post_progress = [this, &last_progress](const ScanProgress& progress) {
                 const auto now = std::chrono::steady_clock::now();
                 if (now - last_progress < std::chrono::milliseconds(250) && !cancel_scan_.load()) {
                     return;
@@ -361,7 +374,10 @@ void App::StartScan() {
                 if (!PostMessageW(hwnd_, kMsgScanProgress, 0, reinterpret_cast<LPARAM>(posted))) {
                     delete posted;
                 }
-            });
+            };
+            result = all_drives
+                ? scanner.ScanAllFixedDrives(cancel_scan_, post_progress)
+                : scanner.ScanCommonFolders(cancel_scan_, post_progress);
         } catch (const std::bad_alloc&) {
             result.cancelled = true;
             result.error_message = L"扫描停止：内存不足。";
@@ -387,7 +403,46 @@ void App::StopScan() {
     cancel_scan_.store(true);
 }
 
+void App::RequestStop(bool exit_after_stop) {
+    if (!scanning_) {
+        if (exit_after_stop) {
+            DestroyWindow(hwnd_);
+        }
+        return;
+    }
+
+    exit_when_scan_finishes_ = exit_when_scan_finishes_ || exit_after_stop;
+    if (!stop_requested_) {
+        stop_requested_ = true;
+        stop_requested_at_ = std::chrono::steady_clock::now();
+    }
+    StopScan();
+    SetTimer(hwnd_, kScanWatchdogTimer, 1000, nullptr);
+}
+
+void App::CheckScanWatchdog() {
+    if (!scanning_) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (stop_requested_) {
+        const auto stop_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - stop_requested_at_);
+        if (stop_elapsed.count() >= 15) {
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+        return;
+    }
+
+    const auto idle_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_at_);
+    if (idle_elapsed.count() >= 90) {
+        RequestStop(false);
+        UpdateStatus(L"扫描 90 秒没有进展，已自动请求停止。如果系统调用无响应，程序会在 15 秒后强制结束。");
+    }
+}
+
 void App::OnScanProgress(std::unique_ptr<ScanProgress> progress) {
+    last_progress_at_ = std::chrono::steady_clock::now();
     std::wstring path = progress->current_path;
     constexpr std::size_t kMaxPathShown = 140;
     if (path.size() > kMaxPathShown) {
@@ -395,7 +450,14 @@ void App::OnScanProgress(std::unique_ptr<ScanProgress> progress) {
     }
 
     std::wostringstream out;
-    out << L"已查看 " << progress->files_seen << L" 个文件，图片 " << progress->image_files
+    const double elapsed = std::max(
+        1.0,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - scan_started_at_).count());
+    const std::uint64_t files_per_second = static_cast<std::uint64_t>(progress->files_seen / elapsed);
+    out << (progress->phase.empty() ? L"正在扫描" : progress->phase)
+        << L"；已查看 " << progress->files_seen << L" 个文件（约 " << files_per_second
+        << L" 个/秒），图片 " << progress->image_files
+        << L" 个，候选 " << progress->candidate_files
         << L" 个，已哈希 " << progress->files_hashed << L" 个，跳过目录 " << progress->skipped_dirs
         << L" 个。当前：" << path;
     UpdateStatus(out.str());
@@ -406,6 +468,8 @@ void App::OnScanDone(std::unique_ptr<ScanResult> result) {
         scan_thread_.join();
     }
     scanning_ = false;
+    stop_requested_ = false;
+    KillTimer(hwnd_, kScanWatchdogTimer);
     SendMessageW(progress_bar_, PBM_SETMARQUEE, FALSE, 0);
     SendMessageW(progress_bar_, PBM_SETPOS, 0, 0);
 
@@ -441,6 +505,10 @@ void App::OnScanDone(std::unique_ptr<ScanResult> result) {
         << L" 个；跳过目录 " << result->progress.skipped_dirs << L" 个。";
     UpdateStatus(out.str());
     UpdateButtons();
+
+    if (exit_when_scan_finishes_) {
+        DestroyWindow(hwnd_);
+    }
 }
 
 void App::PopulateGroups() {
@@ -591,6 +659,7 @@ void App::RemoveDeletedFiles(const std::vector<std::wstring>& deleted) {
 
 void App::UpdateButtons() {
     EnableWindow(scan_button_, scanning_ ? FALSE : TRUE);
+    EnableWindow(scan_all_button_, scanning_ ? FALSE : TRUE);
     EnableWindow(stop_button_, scanning_ ? TRUE : FALSE);
     EnableWindow(auto_button_, (!scanning_ && !groups_.empty()) ? TRUE : FALSE);
     EnableWindow(delete_button_, (!scanning_ && !groups_.empty()) ? TRUE : FALSE);
@@ -737,11 +806,14 @@ LRESULT App::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     case WM_COMMAND:
         switch (LOWORD(wparam)) {
         case kIdScan:
-            StartScan();
+            StartScan(false);
+            return 0;
+        case kIdScanAll:
+            StartScan(true);
             return 0;
         case kIdStop:
-            StopScan();
-            UpdateStatus(L"正在请求停止扫描...");
+            RequestStop(false);
+            UpdateStatus(L"正在请求停止扫描。如果系统调用无响应，程序会在 15 秒后强制结束。");
             return 0;
         case kIdAuto:
             AutoSelect();
@@ -777,16 +849,33 @@ LRESULT App::HandleMessage(UINT message, WPARAM wparam, LPARAM lparam) {
     case kMsgScanDone:
         OnScanDone(std::unique_ptr<ScanResult>(reinterpret_cast<ScanResult*>(lparam)));
         return 0;
+    case WM_TIMER:
+        if (wparam == kScanWatchdogTimer) {
+            CheckScanWatchdog();
+            return 0;
+        }
+        break;
     case WM_CLOSE:
         if (scanning_) {
-            if (MessageBoxQuestion(hwnd_, L"扫描仍在进行。要停止扫描并退出吗？", L"退出") != IDYES) {
+            if (!exit_when_scan_finishes_ &&
+                MessageBoxQuestion(hwnd_, L"扫描仍在进行。要停止扫描并退出吗？", L"退出") != IDYES) {
                 return 0;
             }
-            StopScan();
+            exit_when_scan_finishes_ = true;
+            close_requested_at_ = std::chrono::steady_clock::now();
+            RequestStop(true);
+            EnableWindow(scan_button_, FALSE);
+            EnableWindow(scan_all_button_, FALSE);
+            EnableWindow(stop_button_, FALSE);
+            EnableWindow(auto_button_, FALSE);
+            EnableWindow(delete_button_, FALSE);
+            UpdateStatus(L"正在停止扫描并退出。如果磁盘枚举无响应，程序会在 15 秒后强制结束。");
+            return 0;
         }
         DestroyWindow(hwnd_);
         return 0;
     case WM_DESTROY:
+        KillTimer(hwnd_, kScanWatchdogTimer);
         StopScan();
         PostQuitMessage(0);
         return 0;

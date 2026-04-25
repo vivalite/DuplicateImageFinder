@@ -3,6 +3,8 @@
 #include "hash.h"
 
 #include <windows.h>
+#include <knownfolders.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <atomic>
@@ -31,6 +33,67 @@ bool IsImagePath(const std::wstring& path) {
     return ext == L".jpg" || ext == L".jpeg" || ext == L".png" || ext == L".bmp" ||
            ext == L".gif" || ext == L".webp" || ext == L".tif" || ext == L".tiff" ||
            ext == L".heic" || ext == L".ico";
+}
+
+std::wstring Lower(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return text;
+}
+
+bool StartsWith(const std::wstring& text, const std::wstring& prefix) {
+    return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool ShouldSkipDirectory(const WIN32_FIND_DATAW& data) {
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return true;
+    }
+
+    const std::wstring name = Lower(data.cFileName);
+    static const std::vector<std::wstring> kSkipNames = {
+        L"$recycle.bin",
+        L"system volume information",
+        L"windows",
+        L"program files",
+        L"program files (x86)",
+        L"programdata",
+        L"appdata",
+        L".git",
+        L".svn",
+        L".hg",
+        L".vs",
+        L".cache",
+        L"__pycache__",
+        L"node_modules",
+        L"packages",
+        L"vcpkg_installed",
+        L"bin",
+        L"obj",
+        L"debug",
+        L"release",
+        L"x64",
+        L"x86",
+        L"arm",
+        L"arm64",
+        L"build",
+        L"dist",
+        L"target",
+        L"vendor",
+        L"plugins",
+        L"library",
+        L"intermediate",
+        L"binaries",
+        L"deriveddatacache",
+        L"saved",
+        L"temp"
+    };
+
+    if (std::find(kSkipNames.begin(), kSkipNames.end(), name) != kSkipNames.end()) {
+        return true;
+    }
+    return StartsWith(name, L"sdk") || StartsWith(name, L"windows kits");
 }
 
 std::uint64_t FileSizeFromFindData(const WIN32_FIND_DATAW& data) {
@@ -94,7 +157,9 @@ void EnumerateDirectory(const std::wstring& root,
             progress.current_path = path;
 
             if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-                if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+                if (ShouldSkipDirectory(data)) {
+                    ++progress.skipped_dirs;
+                } else {
                     pending.push_back(std::move(path));
                 }
                 continue;
@@ -136,6 +201,69 @@ std::vector<std::wstring> FixedDrives() {
     return drives;
 }
 
+bool DirectoryExists(const std::wstring& path) {
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+void AddKnownFolder(std::vector<std::wstring>& roots, const KNOWNFOLDERID& folder_id) {
+    PWSTR path = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(folder_id, KF_FLAG_DEFAULT, nullptr, &path)) && path) {
+        std::wstring folder(path);
+        CoTaskMemFree(path);
+        if (DirectoryExists(folder) && std::find(roots.begin(), roots.end(), folder) == roots.end()) {
+            roots.push_back(std::move(folder));
+        }
+    }
+}
+
+std::vector<std::wstring> CommonFolders() {
+    std::vector<std::wstring> roots;
+    AddKnownFolder(roots, FOLDERID_Pictures);
+    AddKnownFolder(roots, FOLDERID_Desktop);
+    AddKnownFolder(roots, FOLDERID_Downloads);
+
+    wchar_t user_profile[MAX_PATH]{};
+    DWORD size = MAX_PATH;
+    if (GetEnvironmentVariableW(L"USERPROFILE", user_profile, size) > 0) {
+        const std::wstring profile(user_profile);
+        const std::wstring one_drive_pictures = profile + L"\\OneDrive\\Pictures";
+        if (DirectoryExists(one_drive_pictures) &&
+            std::find(roots.begin(), roots.end(), one_drive_pictures) == roots.end()) {
+            roots.push_back(one_drive_pictures);
+        }
+    }
+    return roots.empty() ? FixedDrives() : roots;
+}
+
+struct SizeBucket {
+    std::uint32_t count = 0;
+    std::optional<ImageFile> first;
+    std::vector<ImageFile> candidates;
+};
+
+void AddImageBySize(std::unordered_map<std::uint64_t, SizeBucket>& buckets,
+                    const std::wstring& path,
+                    const WIN32_FIND_DATAW& data) {
+    ImageFile file;
+    file.path = path;
+    file.size = FileSizeFromFindData(data);
+    file.creation_time = data.ftCreationTime;
+    file.write_time = data.ftLastWriteTime;
+
+    SizeBucket& bucket = buckets[file.size];
+    ++bucket.count;
+    if (bucket.count == 1) {
+        bucket.first = std::move(file);
+    } else {
+        if (bucket.count == 2 && bucket.first) {
+            bucket.candidates.push_back(std::move(*bucket.first));
+            bucket.first.reset();
+        }
+        bucket.candidates.push_back(std::move(file));
+    }
+}
+
 unsigned int HashWorkerCount(std::size_t candidate_count) {
     if (candidate_count < 2) {
         return 1;
@@ -159,8 +287,10 @@ std::vector<ImageFile> HashCandidates(std::vector<ImageFile>& candidates,
         return hashed_files;
     }
 
+    progress.phase = L"正在哈希候选图片";
+
     const unsigned int worker_count = HashWorkerCount(candidates.size());
-    std::vector<std::optional<ImageFile>> hashed(candidates.size());
+    hashed_files.reserve(std::min<std::size_t>(candidates.size(), 65536));
     std::vector<std::thread> workers;
     workers.reserve(worker_count);
 
@@ -172,6 +302,7 @@ std::vector<ImageFile> HashCandidates(std::vector<ImageFile>& candidates,
 
     std::mutex current_mutex;
     std::wstring current_path = progress.current_path;
+    std::mutex hashed_mutex;
     std::mutex error_mutex;
     std::exception_ptr worker_error;
 
@@ -195,7 +326,8 @@ std::vector<ImageFile> HashCandidates(std::vector<ImageFile>& candidates,
                     files_hashed.fetch_add(1, std::memory_order_relaxed);
                     if (hash) {
                         candidates[index].hash = *hash;
-                        hashed[index] = std::move(candidates[index]);
+                        std::lock_guard lock(hashed_mutex);
+                        hashed_files.push_back(std::move(candidates[index]));
                     }
                 }
             } catch (...) {
@@ -239,11 +371,6 @@ std::vector<ImageFile> HashCandidates(std::vector<ImageFile>& candidates,
         std::rethrow_exception(worker_error);
     }
 
-    for (auto& file : hashed) {
-        if (file && !file->hash.empty()) {
-            hashed_files.push_back(std::move(*file));
-        }
-    }
     return hashed_files;
 }
 
@@ -268,49 +395,92 @@ std::wstring FormatBytes(std::uint64_t bytes) {
     return out.str();
 }
 
-ScanResult Scanner::ScanAllFixedDrives(const std::atomic_bool& cancel, const ProgressCallback& callback) {
-    ScanResult result;
-    std::unordered_map<std::uint64_t, std::vector<ImageFile>> by_size;
-    std::vector<std::wstring> drives = FixedDrives();
+namespace {
 
-    for (const auto& drive : drives) {
+ScanResult ScanRoots(const std::vector<std::wstring>& roots,
+                     const std::atomic_bool& cancel,
+                     const ProgressCallback& callback) {
+    ScanResult result;
+    std::unordered_map<std::uint64_t, SizeBucket> by_size;
+
+    for (const auto& root : roots) {
         if (cancel.load()) {
             break;
         }
-        result.progress.current_path = drive;
+        result.progress.phase = L"正在枚举文件";
+        result.progress.current_path = root;
         if (callback) {
             callback(result.progress);
         }
-        EnumerateDirectory(drive, cancel, callback, result.progress, true,
+        EnumerateDirectory(root, cancel, callback, result.progress, true,
                            [&](const std::wstring& path, const WIN32_FIND_DATAW& data) {
-            ImageFile file;
-            file.path = path;
-            file.size = FileSizeFromFindData(data);
-            file.creation_time = data.ftCreationTime;
-            file.write_time = data.ftLastWriteTime;
-            by_size[file.size].push_back(std::move(file));
+            AddImageBySize(by_size, path, data);
         });
     }
 
     if (!cancel.load()) {
-        std::vector<ImageFile> candidates;
-        for (auto& [size, files] : by_size) {
-            if (files.size() < 2) {
-                continue;
-            }
-            candidates.reserve(candidates.size() + files.size());
-            for (auto& file : files) {
-                candidates.push_back(std::move(file));
+        result.progress.phase = L"正在准备候选图片";
+        result.progress.current_path = L"";
+        if (callback) {
+            callback(result.progress);
+        }
+
+        std::size_t total_candidates = 0;
+        for (const auto& [size, bucket] : by_size) {
+            if (bucket.candidates.size() >= 2) {
+                total_candidates += bucket.candidates.size();
             }
         }
 
+        std::vector<ImageFile> candidates;
+        candidates.reserve(total_candidates);
+        std::uint64_t prepared = 0;
+        for (auto& [size, bucket] : by_size) {
+            if (cancel.load()) {
+                break;
+            }
+            if (bucket.candidates.size() < 2) {
+                continue;
+            }
+            for (auto& file : bucket.candidates) {
+                if (cancel.load()) {
+                    break;
+                }
+                result.progress.current_path = file.path;
+                candidates.push_back(std::move(file));
+                ++prepared;
+                result.progress.candidate_files = prepared;
+                if (callback && (prepared % 8192 == 0)) {
+                    callback(result.progress);
+                }
+            }
+        }
+        result.progress.candidate_files = prepared;
+        if (callback) {
+            callback(result.progress);
+        }
+
         std::vector<ImageFile> hashed_files = HashCandidates(candidates, cancel, callback, result.progress);
+        result.progress.phase = L"正在整理结果";
+        result.progress.current_path = L"";
+        if (callback) {
+            callback(result.progress);
+        }
         std::unordered_map<std::wstring, std::vector<ImageFile>> by_hash;
+        std::uint64_t grouped = 0;
         for (auto& file : hashed_files) {
+            if (cancel.load()) {
+                break;
+            }
             std::wstring key = std::to_wstring(file.size);
             key.push_back(L'|');
             key.append(file.hash);
             by_hash[key].push_back(std::move(file));
+            ++grouped;
+            if (callback && (grouped % 8192 == 0)) {
+                result.progress.current_path = L"";
+                callback(result.progress);
+            }
         }
 
         for (auto& [key, files] : by_hash) {
@@ -339,4 +509,14 @@ ScanResult Scanner::ScanAllFixedDrives(const std::atomic_bool& cancel, const Pro
         return (a.size * a.files.size()) > (b.size * b.files.size());
     });
     return result;
+}
+
+}  // namespace
+
+ScanResult Scanner::ScanCommonFolders(const std::atomic_bool& cancel, const ProgressCallback& callback) {
+    return ScanRoots(CommonFolders(), cancel, callback);
+}
+
+ScanResult Scanner::ScanAllFixedDrives(const std::atomic_bool& cancel, const ProgressCallback& callback) {
+    return ScanRoots(FixedDrives(), cancel, callback);
 }
